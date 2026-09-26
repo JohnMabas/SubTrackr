@@ -7,6 +7,7 @@
  *   - GraphQL API at POST /graphql
  *   - Plan REST API at /plans/*
  *   - Prometheus plan cache metrics at GET /metrics/plan-cache
+ *   - Prometheus build pipeline metrics at GET /metrics/build (issue #1285)
  *
  * Start locally:
  *   docker compose up -d redis postgres
@@ -50,6 +51,7 @@ import {
   createIpWhitelistGate,
 } from './services/shared/ipWhitelistService';
 import { serverSessionService } from './services/auth/serverSessionService';
+import { buildMetricsService } from './services/shared/buildMetricsService';
 
 export interface StartServerOptions {
   port?: number;
@@ -150,7 +152,13 @@ function buildRateLimitMiddleware() {
     service: rateLimitingService,
     // Public/observability endpoints never throttle clients missing keys.
     allowMissingKey: true,
-    skipPaths: ['/health', '/metrics/plan-cache', '/metrics/compression', '/metrics/pool'],
+    skipPaths: [
+      '/health',
+      '/metrics/plan-cache',
+      '/metrics/compression',
+      '/metrics/pool',
+      '/metrics/build',
+    ],
     // Per-key tier: read x-subscription-tier header; defaults to FREE.
     getTier: (apiKey, req) => {
       void apiKey;
@@ -267,7 +275,26 @@ function matchPlanId(pathname: string): string | null {
 
 export async function startServer(options: StartServerOptions = {}): Promise<RunningServer> {
   const pool = options.pool ?? (await getPool());
+
+  // Boot time is tracked as a build run so the <2s startup budget from AGENTS.md
+  // is alertable through GET /metrics/build (issue #1285).
+  const bootstrapBuild = buildMetricsService.beginBuild('backend-bootstrap', {
+    runId: process.env['GITHUB_RUN_ID'],
+    commitSha: process.env['GITHUB_SHA'],
+    branch: process.env['GITHUB_REF_NAME'],
+  });
   const planBootstrap = options.planBootstrap ?? (await ensurePlanCache(pool));
+  buildMetricsService.endBuild(bootstrapBuild, {
+    status: 'success',
+    stages: [
+      {
+        stage: 'plan-cache-bootstrap',
+        durationMs: Date.now() - bootstrapBuild.startedAt,
+        status: 'success',
+      },
+    ],
+  });
+
   const planController = createPlanController({ planCache: planBootstrap.planCache });
 
   // Wrap pool with monitoring
@@ -306,7 +333,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
       const tid = req.headers['x-tenant-id'];
       return typeof tid === 'string' ? tid : 'default';
     },
-    bypassPaths: ['/health', '/metrics/plan-cache', '/metrics/compression', '/metrics/pool'],
+    bypassPaths: [
+      '/health',
+      '/metrics/plan-cache',
+      '/metrics/compression',
+      '/metrics/pool',
+      '/metrics/build',
+    ],
   });
 
   // ---------------------------------------------------------------------------
@@ -316,15 +349,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
     serverSessionService.sweepExpiredSessions();
   }, 5 * 60 * 1000);
   sessionSweepTimer.unref();
-
-  // ── IP Whitelist gate ────────────────────────────────────────────────────
-  const checkIpAccess = createIpWhitelistGate({
-    service: ipWhitelistService,
-    getTenantId: (req) => {
-      const tid = req.headers['x-tenant-id'];
-      return (typeof tid === 'string' ? tid : undefined) ?? 'default';
-    },
-  });
 
   // Seed a default permissive CORS policy for the server's own tenant.
   // In production, policies should be loaded from the database per-tenant.
@@ -397,12 +421,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
       if (!ipAllowed) return; // 403 already written
 
       // -----------------------------------------------------------------
-      // IP Whitelist — enforced before rate limiting
-      // -----------------------------------------------------------------
-      const ipAllowed = checkIpAccess(req, res, pathname);
-      if (!ipAllowed) return; // 403 already written
-
-      // -----------------------------------------------------------------
       // Health (bypass rate limiting)
       // -----------------------------------------------------------------
       if (pathname === '/health' && method === 'GET') {
@@ -438,6 +456,23 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
       if (pathname === '/metrics/pool' && method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
         res.end(monitoredPool.prometheusMetrics());
+        return;
+      }
+
+      // -----------------------------------------------------------------
+      // Build metrics  GET /metrics/build  (issue #1285)
+      // -----------------------------------------------------------------
+      if (pathname === '/metrics/build' && method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' });
+        res.end(buildMetricsService.prometheusMetrics());
+        return;
+      }
+
+      // -----------------------------------------------------------------
+      // Build metrics summary  GET /build/metrics  (issue #1285)
+      // -----------------------------------------------------------------
+      if (pathname === '/build/metrics' && method === 'GET') {
+        sendJson(res, 200, buildMetricsService.getMetrics());
         return;
       }
 
@@ -1596,6 +1631,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
         console.info(`[Server] GraphQL  → POST /graphql`);
         console.info(`[Server] Plans    → /plans`);
         console.info(`[Server] Metrics  → GET /metrics/plan-cache`);
+        console.info(`[Server] Build    → GET /build/metrics`);
+        console.info(`[Server] Build    → GET /metrics/build`);
         console.info(`[Server] RateLimit → GET /rate-limits/analytics`);
         console.info(`[Server] RateLimit → GET /rate-limits/status?apiKey=...`);
         console.info(`[Server] RateLimit → GET /rate-limits/status/user?userId=...`);

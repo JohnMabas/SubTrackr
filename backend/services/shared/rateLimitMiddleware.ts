@@ -14,7 +14,7 @@
  */
 
 import { RateLimitingService } from './rateLimitingService';
-import { SubscriptionTier } from '../../src/types/subscription';
+import { SubscriptionTier } from '../../../src/types/subscription';
 
 // ---------------------------------------------------------------------------
 // Shared types

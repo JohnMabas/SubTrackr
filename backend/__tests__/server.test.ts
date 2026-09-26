@@ -10,6 +10,7 @@ import { InMemoryPlanRepository } from '../subscription/domain/PlanRepository';
 import type { PlanMetadata } from '../subscription/domain/types';
 import type { RedisClient } from '../shared/cache/types';
 import { setPlanCacheService } from '../subscription/planCacheRegistry';
+import { buildMetricsService } from '../services/shared/buildMetricsService';
 
 class FakeRedis implements RedisClient {
   private store = new Map<string, string>();
@@ -164,5 +165,39 @@ describe('backend server', () => {
     expect(parsed.data.name).toBe('Growth');
 
     await running.shutdown();
+  });
+
+  it('exposes build metrics in Prometheus and JSON form (issue #1285)', async () => {
+    const pool = makeMockPool();
+    const planBootstrap = makeBootstrap();
+
+    buildMetricsService.reset();
+    buildMetricsService.recordBuildRun({
+      pipeline: 'ci',
+      status: 'success',
+      durationMs: 1_500,
+      branch: 'main',
+      artifacts: [{ name: 'bundle.js', sizeBytes: 400 }],
+    });
+
+    const running = await startServer({ pool, planBootstrap, listen: false });
+    const port = await listenEphemeral(running.server);
+
+    const prometheus = await request(port, '/metrics/build');
+    expect(prometheus.status).toBe(200);
+    expect(prometheus.body).toContain('# TYPE subtrackr_build_runs_total counter');
+    expect(prometheus.body).toContain('subtrackr_build_runs_total{pipeline="ci",status="success"} 1');
+    expect(prometheus.body).toContain('subtrackr_build_duration_p95_ms{pipeline="ci"} 1500');
+    // Boot is tracked as a build run, so a scrape is never empty.
+    expect(prometheus.body).toContain('subtrackr_build_runs_total{pipeline="backend-bootstrap",status="success"} 1');
+
+    const json = await request(port, '/build/metrics');
+    expect(json.status).toBe(200);
+    const summary = JSON.parse(json.body);
+    expect(summary.pipelines.ci).toMatchObject({ totalRuns: 1, successRuns: 1, successRatePct: 100 });
+    expect(summary.totalRuns).toBeGreaterThanOrEqual(2);
+
+    await running.shutdown();
+    buildMetricsService.reset();
   });
 });
