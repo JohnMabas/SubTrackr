@@ -235,6 +235,32 @@ function isBuildStatus(value: unknown): value is BuildStatus {
   return typeof value === 'string' && (BUILD_STATUSES as readonly string[]).includes(value);
 }
 
+/**
+ * CI-specific outcomes folded onto the three exported statuses so a raw
+ * provider payload cannot widen the label set. GitHub Actions `conclusion`
+ * values map as: anything that ran but did not succeed is a `failure`, and
+ * `skipped` work is `cancelled` because it never produced a build.
+ */
+const CI_STATUS_ALIASES: Record<string, BuildStatus> = {
+  success: 'success',
+  neutral: 'success',
+  failure: 'failure',
+  timed_out: 'failure',
+  action_required: 'failure',
+  startup_failure: 'failure',
+  stale: 'failure',
+  cancelled: 'cancelled',
+  canceled: 'cancelled',
+  skipped: 'cancelled',
+};
+
+/** Resolve a status from a canonical value or a CI-specific alias. */
+function resolveBuildStatus(value: unknown): BuildStatus | null {
+  if (isBuildStatus(value)) return value;
+  if (typeof value !== 'string') return null;
+  return CI_STATUS_ALIASES[value.trim().toLowerCase()] ?? null;
+}
+
 /** Coerce a numeric field that may arrive as a string from JSON / CI output. */
 function toFiniteNumber(value: unknown): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
@@ -274,10 +300,11 @@ export function parseBuildRunInput(raw: unknown): BuildRunInput {
   const pipeline = optionalString(obj['pipeline']);
   if (!pipeline) throw new BuildMetricsValidationError('build run requires a non-empty "pipeline"');
 
-  const status = obj['status'];
-  if (!isBuildStatus(status)) {
+  const status = resolveBuildStatus(obj['status'] ?? obj['conclusion'] ?? obj['outcome']);
+  if (!status) {
     throw new BuildMetricsValidationError(
-      `build run status must be one of ${BUILD_STATUSES.join(', ')}`,
+      `build run status must be one of ${BUILD_STATUSES.join(', ')}, either directly or ` +
+        'via a CI alias ("conclusion"/"outcome", e.g. "timed_out" → failure)',
     );
   }
 

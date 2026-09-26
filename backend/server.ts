@@ -8,6 +8,7 @@
  *   - Plan REST API at /plans/*
  *   - Prometheus plan cache metrics at GET /metrics/plan-cache
  *   - Prometheus build pipeline metrics at GET /metrics/build (issue #1285)
+ *   - Build report ingestion at POST /build/metrics (issue #1285)
  *
  * Start locally:
  *   docker compose up -d redis postgres
@@ -15,6 +16,7 @@
  */
 
 import http from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { URL } from 'node:url';
 import { makeExecutableSchema } from '@graphql-tools/schema';
 import { createHandler } from 'graphql-http/lib/use/node';
@@ -229,14 +231,62 @@ async function applyRateLimit(
   return !blocked;
 }
 
-async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
+/** Client fault carrying an explicit HTTP status for the top-level catch. */
+class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'HttpError';
+  }
+}
+
+/** Upper bound on an ingested CI report body (1 MiB). */
+const MAX_BUILD_REPORT_BYTES = 1024 * 1024;
+
+/**
+ * Read and parse a JSON request body.
+ *
+ * @param maxBytes - Optional hard cap; exceeding it aborts with 413 so an
+ *   untrusted upload cannot buffer unbounded memory. Omit for trusted routes
+ *   to preserve the previous unlimited behaviour.
+ */
+async function readJsonBody(req: http.IncomingMessage, maxBytes?: number): Promise<unknown> {
   const chunks: Buffer[] = [];
+  let received = 0;
   for await (const chunk of req) {
-    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    const buf = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+    received += buf.length;
+    if (maxBytes !== undefined && received > maxBytes) {
+      throw new HttpError(413, `request body exceeds ${maxBytes} bytes`);
+    }
+    chunks.push(buf);
   }
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   if (!raw) return {};
-  return JSON.parse(raw) as unknown;
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    throw new HttpError(400, 'request body is not valid JSON');
+  }
+}
+
+/**
+ * Constant-time comparison of a presented token against the configured ingest
+ * secret. Returns false when either side is missing so an unconfigured server
+ * never treats an empty token as valid.
+ */
+function tokenMatches(presented: string, expected: string | undefined): boolean {
+  if (!presented || !expected) return false;
+  const a = Buffer.from(presented, 'utf8');
+  const b = Buffer.from(expected, 'utf8');
+  if (a.length !== b.length) return false;
+  try {
+    return timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
 }
 
 function sendJson(
@@ -473,6 +523,39 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
       // -----------------------------------------------------------------
       if (pathname === '/build/metrics' && method === 'GET') {
         sendJson(res, 200, buildMetricsService.getMetrics());
+        return;
+      }
+
+      // -----------------------------------------------------------------
+      // Build report ingest  POST /build/metrics  (issue #1285)
+      //
+      // CI posts a run report here. Gated on a shared secret because the
+      // payload is untrusted and the route mutates exported metrics; with no
+      // secret configured the route is disabled rather than left open.
+      // -----------------------------------------------------------------
+      if (pathname === '/build/metrics' && method === 'POST') {
+        const ingestSecret = process.env['BUILD_METRICS_INGEST_TOKEN'];
+        if (!ingestSecret) {
+          sendJson(res, 503, {
+            error: 'build report ingest is disabled; set BUILD_METRICS_INGEST_TOKEN to enable',
+          });
+          return;
+        }
+        const authHeader = req.headers['authorization'];
+        const presented = typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+          ? authHeader.slice(7).trim()
+          : '';
+        if (!tokenMatches(presented, ingestSecret)) {
+          sendJson(res, 401, { error: 'invalid or missing build report ingest token' });
+          return;
+        }
+        const report = await readJsonBody(req, MAX_BUILD_REPORT_BYTES);
+        const result = buildMetricsService.ingestBuildReport(report);
+        sendJson(res, 202, {
+          accepted: result.accepted.length,
+          rejected: result.rejected.length,
+          rejections: result.rejected,
+        });
         return;
       }
 
@@ -1605,6 +1688,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
 
       sendJson(res, 404, { error: 'Not found' });
     } catch (err) {
+      if (err instanceof HttpError) {
+        sendJson(res, err.status, { error: err.message });
+        return;
+      }
       console.error('[Server] Request error:', err);
       sendJson(res, 500, { error: 'Internal server error' });
     }
@@ -1633,6 +1720,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
         console.info(`[Server] Metrics  → GET /metrics/plan-cache`);
         console.info(`[Server] Build    → GET /build/metrics`);
         console.info(`[Server] Build    → GET /metrics/build`);
+        console.info(`[Server] Build    → POST /build/metrics`);
         console.info(`[Server] RateLimit → GET /rate-limits/analytics`);
         console.info(`[Server] RateLimit → GET /rate-limits/status?apiKey=...`);
         console.info(`[Server] RateLimit → GET /rate-limits/status/user?userId=...`);

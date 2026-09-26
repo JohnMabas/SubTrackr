@@ -78,14 +78,21 @@ function makeBootstrap(repository = new InMemoryPlanRepository([seedPlan])) {
   return { planCache, redis, repository };
 }
 
+/** `undefined` sends no body; a string is sent verbatim so tests can post bad JSON. */
+function encodeBody(body: unknown): string | undefined {
+  if (body === undefined) return undefined;
+  return typeof body === 'string' ? body : JSON.stringify(body);
+}
+
 function request(
   port: number,
   path: string,
   method = 'GET',
   body?: unknown,
+  headers: Record<string, string> = {},
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const payload = body !== undefined ? JSON.stringify(body) : undefined;
+    const payload = encodeBody(body);
     const req = http.request(
       {
         host: '127.0.0.1',
@@ -93,8 +100,12 @@ function request(
         path,
         method,
         headers: payload
-          ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }
-          : undefined,
+          ? {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(payload),
+              ...headers,
+            }
+          : headers,
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -199,5 +210,174 @@ describe('backend server', () => {
 
     await running.shutdown();
     buildMetricsService.reset();
+  });
+
+  describe('POST /build/metrics ingest (issue #1285)', () => {
+    const TOKEN = 'ingest-secret-token';
+    let previousToken: string | undefined;
+    let shutdowns: Array<() => Promise<void>> = [];
+
+    beforeEach(() => {
+      previousToken = process.env['BUILD_METRICS_INGEST_TOKEN'];
+      process.env['BUILD_METRICS_INGEST_TOKEN'] = TOKEN;
+      buildMetricsService.reset();
+      shutdowns = [];
+    });
+
+    afterEach(async () => {
+      // Always tear down, even when an assertion fails, so a failing test
+      // cannot leave a listening server that hangs the whole run.
+      for (const shutdown of shutdowns.reverse()) {
+        await shutdown();
+      }
+      if (previousToken === undefined) delete process.env['BUILD_METRICS_INGEST_TOKEN'];
+      else process.env['BUILD_METRICS_INGEST_TOKEN'] = previousToken;
+      buildMetricsService.reset();
+    });
+
+    async function serve(): Promise<number> {
+      const running = await startServer({
+        pool: makeMockPool(),
+        planBootstrap: makeBootstrap(),
+        listen: false,
+      });
+      shutdowns.push(running.shutdown);
+      return listenEphemeral(running.server);
+    }
+
+    it('records runs from an authenticated report', async () => {
+      const port = await serve();
+
+      const res = await request(
+        port,
+        '/build/metrics',
+        'POST',
+        {
+          runs: [
+            { pipeline: 'ci', conclusion: 'success', durationMs: 4_200, ref: 'refs/heads/main' },
+            { pipeline: 'ci', status: 'failure', durationMs: 900 },
+          ],
+        },
+        { Authorization: `Bearer ${TOKEN}` },
+      );
+
+      expect(res.status).toBe(202);
+      expect(JSON.parse(res.body)).toMatchObject({ accepted: 2, rejected: 0 });
+
+      const summary = buildMetricsService.getMetrics();
+      expect(summary.pipelines.ci).toMatchObject({
+        totalRuns: 2,
+        successRuns: 1,
+        failureRuns: 1,
+        successRatePct: 50,
+      });
+      expect(summary.pipelines.ci!.lastDurationMs).toBe(900);
+      expect(summary.pipelines.ci!.lastBranch).toBe('refs/heads/main');
+    });
+
+    it('rejects a request with no or wrong token', async () => {
+      const port = await serve();
+
+      const missing = await request(port, '/build/metrics', 'POST', {
+        pipeline: 'ci',
+        status: 'success',
+        durationMs: 10,
+      });
+      expect(missing.status).toBe(401);
+
+      const wrong = await request(
+        port,
+        '/build/metrics',
+        'POST',
+        { pipeline: 'ci', status: 'success', durationMs: 10 },
+        { Authorization: 'Bearer nope' },
+      );
+      expect(wrong.status).toBe(401);
+
+      // A prefix of the secret must not pass the length guard.
+      const prefix = await request(
+        port,
+        '/build/metrics',
+        'POST',
+        { pipeline: 'ci', status: 'success', durationMs: 10 },
+        { Authorization: `Bearer ${TOKEN.slice(0, 5)}` },
+      );
+      expect(prefix.status).toBe(401);
+
+      expect(buildMetricsService.getMetrics().pipelines.ci).toBeUndefined();
+    });
+
+    it('is disabled with 503 when no ingest token is configured', async () => {
+      delete process.env['BUILD_METRICS_INGEST_TOKEN'];
+      const port = await serve();
+
+      const res = await request(
+        port,
+        '/build/metrics',
+        'POST',
+        { pipeline: 'ci', status: 'success', durationMs: 10 },
+        { Authorization: 'Bearer anything' },
+      );
+
+      expect(res.status).toBe(503);
+    });
+
+    it('keeps valid entries from a partly corrupt report and reports the rest', async () => {
+      const port = await serve();
+
+      const res = await request(
+        port,
+        '/build/metrics',
+        'POST',
+        [
+          { pipeline: 'ci', status: 'success', durationMs: 100 },
+          { pipeline: 'ci', status: 'not-a-status', durationMs: 100 },
+          { status: 'success', durationMs: 100 },
+          { pipeline: 'ci', status: 'success', durationMs: -5 },
+        ],
+        { Authorization: `Bearer ${TOKEN}` },
+      );
+
+      expect(res.status).toBe(202);
+      const parsed = JSON.parse(res.body);
+      expect(parsed.accepted).toBe(1);
+      expect(parsed.rejected).toBe(3);
+      expect(parsed.rejections.map((r: { index: number }) => r.index)).toEqual([1, 2, 3]);
+      expect(parsed.rejections[0].reason).toMatch(/status/);
+
+      expect(buildMetricsService.getMetrics().pipelines.ci).toMatchObject({ totalRuns: 1 });
+    });
+
+    it('rejects a malformed body with 400 instead of 500', async () => {
+      const port = await serve();
+
+      const res = await request(port, '/build/metrics', 'POST', '{not json', {
+        Authorization: `Bearer ${TOKEN}`,
+      });
+
+      expect(res.status).toBe(400);
+      expect(JSON.parse(res.body).error).toMatch(/JSON/);
+    });
+
+    it('rejects an oversized report with 413', async () => {
+      const port = await serve();
+
+      const huge = JSON.stringify({
+        runs: [
+          {
+            pipeline: 'ci',
+            status: 'success',
+            durationMs: 1,
+            failureReason: 'x'.repeat(1024 * 1024 + 64),
+          },
+        ],
+      });
+      const res = await request(port, '/build/metrics', 'POST', huge, {
+        Authorization: `Bearer ${TOKEN}`,
+      });
+
+      expect(res.status).toBe(413);
+      expect(buildMetricsService.getMetrics().pipelines.ci).toBeUndefined();
+    });
   });
 });

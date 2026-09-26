@@ -15,9 +15,9 @@ It solves three gaps:
 ## Architecture
 
 ```
-beginBuild('ci')                       recordBuildRun({ pipeline, status, ... })
-      │                                          │
-      ▼                                          ▼
+ beginBuild('ci')                       recordBuildRun({ pipeline, status, ... })
+       │                                          │
+       ▼                                          ▼
  ┌────────────────┐                     ┌──────────────────────┐
  │ in-flight map  │──── endBuild() ────▶│ per-pipeline state  │
  │ + in_progress  │                     │  counters, samples, │
@@ -27,6 +27,8 @@ beginBuild('ci')                       recordBuildRun({ pipeline, status, ... })
                             ┌───────────────────────┴───────────────────────┐
                             ▼                                               ▼
                  GET /metrics/build (text)                    GET /build/metrics (JSON)
+                                                                            ▲
+                             POST /build/metrics (CI report) ───────────────┘
 ```
 
 ## Endpoints
@@ -35,8 +37,9 @@ beginBuild('ci')                       recordBuildRun({ pipeline, status, ... })
 |---|---|---|---|
 | `GET` | `/metrics/build` | `text/plain; version=0.0.4` | Prometheus exposition text |
 | `GET` | `/build/metrics` | `application/json` | Aggregated summary for dashboards |
+| `POST` | `/build/metrics` | `application/json` | Ingest a CI build report (secret required) |
 
-Both endpoints bypass rate limiting and the IP allow-list gate, matching the other `/metrics/*` routes.
+The two `GET` endpoints bypass rate limiting and the IP allow-list gate, matching the other `/metrics/*` routes. `POST` goes through both gates, since it mutates exported state.
 
 ## Recording Builds
 
@@ -78,6 +81,7 @@ Accepted shapes: a single run object, an array of runs, or `{ runs: [...] }` (al
 
 | Canonical field | Accepted aliases | Type coercion |
 |---|---|---|
+| `status` | `conclusion`, `outcome` | CI outcomes folded onto the three statuses (below) |
 | `durationMs` | `duration_ms` | numeric strings coerced (`"1200"` → `1200`) |
 | `runId` | `run_id`, `id` | numbers stringified |
 | `commitSha` | `commit_sha`, `sha` | — |
@@ -88,6 +92,60 @@ Accepted shapes: a single run object, an array of runs, or `{ runs: [...] }` (al
 | `artifacts[].sizeBytes` | `artifacts[].size_bytes` | numeric strings coerced |
 
 A missing `stages[].status` falls back to the run status, so a failed run attributes its failure to every stage that has no explicit status.
+
+Provider-specific outcomes are folded onto the three exported statuses so a raw CI payload cannot widen the label set:
+
+| CI outcome | Exported status |
+|---|---|
+| `success`, `neutral` | `success` |
+| `failure`, `timed_out`, `action_required`, `startup_failure`, `stale` | `failure` |
+| `cancelled`, `skipped` | `cancelled` |
+
+Anything else is rejected, so a typo or a non-build payload is reported rather than silently recorded as a pass.
+
+## Ingesting From CI
+
+`POST /build/metrics` is the HTTP front door to `ingestBuildReport`. It takes the same shapes and returns `202` with a per-entry breakdown:
+
+```bash
+curl -X POST "$BUILD_METRICS_URL/build/metrics" \
+  -H "Authorization: Bearer $BUILD_METRICS_INGEST_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"runs":[{"pipeline":"ci","conclusion":"success","durationMs":248000,"stages":[]}]}'
+```
+
+```json
+{ "accepted": 1, "rejected": 0, "rejections": [] }
+```
+
+| Status | Meaning |
+|---|---|
+| `202` | Report processed — check `rejected` for per-entry failures |
+| `400` | Body was not valid JSON |
+| `401` | Missing or wrong `Authorization: Bearer` token |
+| `413` | Body exceeded 1 MiB |
+| `503` | `BUILD_METRICS_INGEST_TOKEN` is not configured, so ingest is disabled |
+
+Auth is a constant-time comparison against `BUILD_METRICS_INGEST_TOKEN`. When that variable is unset the route answers `503` rather than falling open, so a deployment without a secret cannot be used to poison its own metrics. Set the same value as the `BUILD_METRICS_INGEST_TOKEN` repository secret and point `BUILD_METRICS_URL` at the deployment.
+
+### The CI publisher
+
+`scripts/publish-build-metrics.js` turns a GitHub Actions run into that payload. It reads per-job timings from the REST API, so every job becomes a `stages[]` entry with a real duration rather than a guess, and the run conclusion comes from the aggregate of the pipeline's jobs.
+
+```bash
+node scripts/publish-build-metrics.js --dry-run  # print the payload, POST nothing
+npm run build:metrics:publish                    # build and POST
+```
+
+| Flag / variable | Effect |
+|---|---|
+| `--dry-run` | Print the report and exit without publishing |
+| `--strict` | Exit `1` when publishing fails (default: warn and exit `0`) |
+| `BUILD_METRICS_PIPELINE` | Pipeline label, defaults to `ci` |
+| `BUILD_METRICS_REASON` | Failure reason override, e.g. the failed gate names |
+| `BUILD_METRICS_STARTED_AT` | ISO run start; falls back to the job span |
+
+The `build-metrics` job in `.github/workflows/ci.yml` runs this with `if: always()`, so a red pipeline still reports its duration and which gates failed. It is deliberately absent from the `merge-protection` and `ci-success` `needs` lists: a metrics outage must not block a merge, and the default non-strict mode means a failed publish never turns a green pipeline red. Forks cannot read repository secrets, so their runs skip publishing with a log line.
 
 ## Artifact Budget
 
@@ -237,7 +295,7 @@ All growth is capped so a long-running process cannot leak:
 `recordBuildRun` and `beginBuild` throw `BuildMetricsValidationError` for programmer errors and increment `rejectedRecords.validation`:
 
 - missing or blank `pipeline`
-- `status` outside `success | failure | cancelled`
+- `status` outside `success | failure | cancelled`, with no matching CI alias
 - `durationMs` that is negative, `NaN` or infinite
 - `endBuild` with a handle that was never issued or already ended
 
@@ -255,4 +313,11 @@ Malformed nested entries are dropped rather than fatal, and counted separately s
 npx jest --config jest.backend.config.js backend/services/shared/__tests__/buildMetricsService.test.ts
 ```
 
-Covers counter aggregation, percentile windows, stage/artifact budgets, in-flight tracking, handle reuse rejection, malformed record rejection, untrusted report ingestion, label escaping, non-finite rendering, sink error isolation, and the HTTP surface in `backend/__tests__/server.test.ts`.
+Covers counter aggregation, percentile windows, stage/artifact budgets, in-flight tracking, handle reuse rejection, malformed record rejection, untrusted report ingestion, CI outcome folding, label escaping, non-finite rendering, sink error isolation, and the HTTP surface in `backend/__tests__/server.test.ts` (scrape, summary, and the ingest route's 202/400/401/413/503 paths).
+
+The CI publisher is plain Node with no test runner dependency; assert on its exports directly or inspect a payload with `--dry-run`:
+
+```bash
+node -e "const s=require('./scripts/publish-build-metrics');console.log(s.toStages([{name:'lint',conclusion:'success',started_at:'2026-01-01T00:00:00Z',completed_at:'2026-01-01T00:00:09Z'}]))"
+node scripts/publish-build-metrics.js --dry-run
+```

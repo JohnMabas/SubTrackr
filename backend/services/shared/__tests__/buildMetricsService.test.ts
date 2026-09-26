@@ -465,6 +465,46 @@ describe('BuildMetricsService', () => {
       ]);
     });
 
+    it('folds CI-specific outcomes onto the three exported statuses', () => {
+      const service = makeService();
+      const result = service.ingestBuildReport({
+        workflow_runs: [
+          { pipeline: 'ci', conclusion: 'success', durationMs: 10 },
+          { pipeline: 'ci', conclusion: 'timed_out', durationMs: 20 },
+          { pipeline: 'ci', conclusion: 'action_required', durationMs: 30 },
+          { pipeline: 'ci', conclusion: 'skipped', durationMs: 40 },
+          { pipeline: 'ci', conclusion: 'CANCELLED', durationMs: 50 },
+          { pipeline: 'ci', outcome: 'neutral', durationMs: 60 },
+        ],
+      });
+
+      expect(result.rejected).toHaveLength(0);
+      expect(result.accepted.map((r) => r.status)).toEqual([
+        'success',
+        'failure',
+        'failure',
+        'cancelled',
+        'cancelled',
+        'success',
+      ]);
+      expect(service.getMetrics().pipelines.ci).toMatchObject({
+        totalRuns: 6,
+        successRuns: 2,
+        failureRuns: 2,
+        cancelledRuns: 2,
+      });
+    });
+
+    it('still rejects a status that is neither canonical nor a known alias', () => {
+      const service = makeService();
+      const result = service.ingestBuildReport([
+        { pipeline: 'ci', conclusion: 'completed', durationMs: 10 },
+      ]);
+
+      expect(result.accepted).toHaveLength(0);
+      expect(result.rejected[0].reason).toMatch(/conclusion/);
+    });
+
     it('returns an empty result for unusable report shapes', () => {
       const service = makeService();
 
