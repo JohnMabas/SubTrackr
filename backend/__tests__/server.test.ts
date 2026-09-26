@@ -11,6 +11,7 @@ import type { PlanMetadata } from '../subscription/domain/types';
 import type { RedisClient } from '../shared/cache/types';
 import { setPlanCacheService } from '../subscription/planCacheRegistry';
 import { buildMetricsService } from '../services/shared/buildMetricsService';
+import { rateLimitingService } from '../services/shared/rateLimitingService';
 
 class FakeRedis implements RedisClient {
   private store = new Map<string, string>();
@@ -428,21 +429,47 @@ describe('backend server', () => {
       expect(Number(second.headers['x-ratelimit-remaining'])).toBeLessThan(100);
     });
 
-    it('eventually throttles a key that exhausts its hourly quota', async () => {
+    it('throttles a key that drains its burst bucket', async () => {
       const port = await serve();
       const key = `exhaust-${Date.now()}`;
       const statuses: number[] = [];
 
-      // FREE tier allows 100 requests per hour.
+      // A tight loop is bounded by the token bucket (20 tokens, 1/s refill on
+      // the free tier) long before the 100/hour window cap, so this asserts the
+      // bucket, not the window.
       for (let i = 0; i < 130; i++) {
         const res = await request(port, '/plans', 'POST', planBody, { 'x-api-key': key });
         statuses.push(res.status);
       }
 
       const created = statuses.filter((s) => s === 201).length;
-      const throttled = statuses.filter((s) => s === 429).length;
-      expect(created).toBeLessThanOrEqual(101);
-      expect(throttled).toBeGreaterThan(0);
+      expect(created).toBeGreaterThan(0);
+      expect(created).toBeLessThanOrEqual(25);
+      expect(statuses.filter((s) => s === 429)).toHaveLength(130 - created);
+    });
+
+    it('throttles a key that passes its hourly cap', async () => {
+      const port = await serve();
+      const key = `hourly-${Date.now()}`;
+      // A generous bucket isolates the window cap as the only binding limit.
+      rateLimitingService.setCustomLimits(key, {
+        hourlyLimit: 5,
+        burstLimit: 50,
+        refillRatePerSecond: 50,
+      });
+
+      try {
+        const statuses: number[] = [];
+        for (let i = 0; i < 8; i++) {
+          const res = await request(port, '/plans', 'POST', planBody, { 'x-api-key': key });
+          statuses.push(res.status);
+        }
+
+        expect(statuses.filter((s) => s === 201)).toHaveLength(5);
+        expect(statuses.filter((s) => s === 429)).toHaveLength(3);
+      } finally {
+        rateLimitingService.clearCustomLimits(key);
+      }
     });
 
     it('meters routes declared above the old rate limit call site', async () => {
