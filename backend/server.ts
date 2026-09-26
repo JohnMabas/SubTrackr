@@ -172,8 +172,41 @@ function buildRateLimitMiddleware() {
 }
 
 /**
+ * A `http.ServerResponse` augmented with the Express-style surface the rate
+ * limit middleware expects (`status` / `set` / `json`).
+ *
+ * The middleware is handed the *real* response rather than a stand-in, so the
+ * `writeHead` / `end` it wraps are the ones the route handlers actually call.
+ * A stand-in saw none of the real writes, which is why usage was never recorded
+ * and no limit could ever be reached.
+ */
+type AttachableResponse = http.ServerResponse & {
+  status(code: number): AttachableResponse;
+  set(name: string, value: string): AttachableResponse;
+  json(body: unknown): void;
+};
+
+function asAttachableResponse(res: http.ServerResponse): AttachableResponse {
+  const attachable = res as AttachableResponse;
+  attachable.status = function status(code: number) {
+    this.statusCode = code;
+    return this;
+  };
+  attachable.set = function set(name: string, value: string) {
+    this.setHeader(name, value);
+    return this;
+  };
+  attachable.json = function json(body: unknown) {
+    this.writeHead(this.statusCode, { 'Content-Type': 'application/json' });
+    this.end(JSON.stringify(body));
+  };
+  return attachable;
+}
+
+/**
  * Apply rate limit middleware inline (no Express).
- * Returns true if the request should continue, false if a 429 was sent.
+ * Returns true if the request should continue, false if the limiter already
+ * answered with 401/429.
  */
 async function applyRateLimit(
   rl: ReturnType<typeof buildRateLimitMiddleware>,
@@ -181,8 +214,6 @@ async function applyRateLimit(
   res: http.ServerResponse,
   path: string,
 ): Promise<boolean> {
-  let blocked = false;
-
   const pseudoReq = {
     method: req.method,
     path,
@@ -191,44 +222,12 @@ async function applyRateLimit(
     ip: (req.socket as { remoteAddress?: string } | null)?.remoteAddress,
   };
 
-  // Minimal Response adapter: the middleware speaks Express-style (status/json)
-  // while the raw http server only exposes writeHead/end.
-  const pseudoRes = {
-    _statusCode: 200,
-    setHeader(name: string, value: string | number) {
-      res.setHeader(name, String(value));
-    },
-    header(name: string, value: string) {
-      res.setHeader(name, value);
-      return this;
-    },
-    set(name: string, value: string) {
-      res.setHeader(name, value);
-      return this;
-    },
-    status(code: number) {
-      this._statusCode = code;
-      return this;
-    },
-    writeHead(status: number, headers?: Record<string, string>) {
-      res.writeHead(status, headers);
-    },
-    end(body?: string) {
-      res.end(body);
-      blocked = true;
-    },
-    json(body: unknown) {
-      res.writeHead(this._statusCode, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(body));
-      blocked = true;
-    },
-  };
-
-  await rl(pseudoReq, pseudoRes, () => {
+  await rl(pseudoReq, asAttachableResponse(res), () => {
     /* proceed */
   });
 
-  return !blocked;
+  // The limiter terminates the response itself when it denies the request.
+  return !res.writableEnded;
 }
 
 /** Client fault carrying an explicit HTTP status for the top-level catch. */
@@ -469,6 +468,17 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
       // -----------------------------------------------------------------
       const ipAllowed = ipWhitelistGate(req, res, pathname);
       if (!ipAllowed) return; // 403 already written
+
+      // -----------------------------------------------------------------
+      // Rate limiting (issue #913)
+      //
+      // Runs ahead of the whole route table, not just the routes below it, so
+      // every endpoint is actually metered. Paths in `skipPaths` (plus the
+      // service defaults in rateLimitingService.bypass.paths) are exempt, which
+      // is what keeps the observability endpoints scrapeable.
+      // -----------------------------------------------------------------
+      const proceed = await applyRateLimit(rateLimitMw, req, res, pathname);
+      if (!proceed) return; // 429 already sent
 
       // -----------------------------------------------------------------
       // Health (bypass rate limiting)
@@ -1639,12 +1649,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<Run
         res.end(getHubSpotService().prometheusMetrics());
         return;
       }
-
-      // -----------------------------------------------------------------
-      // Apply rate limiting to all other routes
-      // -----------------------------------------------------------------
-      const proceed = await applyRateLimit(rateLimitMw, req, res, pathname);
-      if (!proceed) return; // 429 already sent
 
       // -----------------------------------------------------------------
       // GraphQL

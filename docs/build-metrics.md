@@ -39,7 +39,17 @@ It solves three gaps:
 | `GET` | `/build/metrics` | `application/json` | Aggregated summary for dashboards |
 | `POST` | `/build/metrics` | `application/json` | Ingest a CI build report (secret required) |
 
-The two `GET` endpoints bypass rate limiting and the IP allow-list gate, matching the other `/metrics/*` routes. `POST` goes through both gates, since it mutates exported state.
+All three routes sit behind the IP allow-list gate — that gate has no bypass list, and this endpoint is not a special case.
+
+Rate limiting differs per route, and the rule is the `skipPaths` list rather than anything specific to build metrics:
+
+| Route | Rate limited | Notes |
+|---|---|---|
+| `GET /metrics/build` | No | Listed in `buildRateLimitMiddleware`'s `skipPaths`, like the other Prometheus endpoints, so a scrape can never throttle itself |
+| `GET /build/metrics` | Only for keyed requests | Not in `skipPaths`. It is called with no `Authorization`/`x-api-key` header, `allowMissingKey` is on, and keyless requests are never throttled — so a dashboard can poll it as often as it likes. Send an API key and it is metered like any other route |
+| `POST /build/metrics` | Yes | The ingest secret is sent as `Authorization: Bearer <token>`, which is also how the rate limiter resolves a key, so the token is the metered identity and every CI run shares one bucket. Use a dedicated secret with headroom rather than a customer's API key |
+
+`POST` is additionally authenticated with the ingest secret, since it mutates exported state.
 
 ## Recording Builds
 

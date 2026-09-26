@@ -90,7 +90,7 @@ function request(
   method = 'GET',
   body?: unknown,
   headers: Record<string, string> = {},
-): Promise<{ status: number; body: string }> {
+): Promise<{ status: number; body: string; headers: Record<string, string> }> {
   return new Promise((resolve, reject) => {
     const payload = encodeBody(body);
     const req = http.request(
@@ -114,6 +114,9 @@ function request(
           resolve({
             status: res.statusCode ?? 0,
             body: Buffer.concat(chunks).toString('utf8'),
+            headers: Object.fromEntries(
+              Object.entries(res.headers).map(([k, v]) => [k.toLowerCase(), String(v)]),
+            ),
           });
         });
       },
@@ -213,13 +216,12 @@ describe('backend server', () => {
   });
 
   describe('POST /build/metrics ingest (issue #1285)', () => {
-    const TOKEN = 'ingest-secret-token';
     let previousToken: string | undefined;
     let shutdowns: Array<() => Promise<void>> = [];
+    let tokenSeq = 0;
 
     beforeEach(() => {
       previousToken = process.env['BUILD_METRICS_INGEST_TOKEN'];
-      process.env['BUILD_METRICS_INGEST_TOKEN'] = TOKEN;
       buildMetricsService.reset();
       shutdowns = [];
     });
@@ -235,18 +237,23 @@ describe('backend server', () => {
       buildMetricsService.reset();
     });
 
-    async function serve(): Promise<number> {
+    // The ingest token is sent as `Authorization: Bearer`, which is also how the
+    // rate limiter resolves a key, so each test gets its own secret — and
+    // therefore its own quota bucket.
+    async function serve(): Promise<{ port: number; token: string }> {
+      const token = `ingest-secret-${++tokenSeq}`;
+      process.env['BUILD_METRICS_INGEST_TOKEN'] = token;
       const running = await startServer({
         pool: makeMockPool(),
         planBootstrap: makeBootstrap(),
         listen: false,
       });
       shutdowns.push(running.shutdown);
-      return listenEphemeral(running.server);
+      return { port: await listenEphemeral(running.server), token };
     }
 
     it('records runs from an authenticated report', async () => {
-      const port = await serve();
+      const { port, token } = await serve();
 
       const res = await request(
         port,
@@ -258,7 +265,7 @@ describe('backend server', () => {
             { pipeline: 'ci', status: 'failure', durationMs: 900 },
           ],
         },
-        { Authorization: `Bearer ${TOKEN}` },
+        { Authorization: `Bearer ${token}` },
       );
 
       expect(res.status).toBe(202);
@@ -276,7 +283,7 @@ describe('backend server', () => {
     });
 
     it('rejects a request with no or wrong token', async () => {
-      const port = await serve();
+      const { port, token } = await serve();
 
       const missing = await request(port, '/build/metrics', 'POST', {
         pipeline: 'ci',
@@ -300,7 +307,7 @@ describe('backend server', () => {
         '/build/metrics',
         'POST',
         { pipeline: 'ci', status: 'success', durationMs: 10 },
-        { Authorization: `Bearer ${TOKEN.slice(0, 5)}` },
+        { Authorization: `Bearer ${token.slice(0, 5)}` },
       );
       expect(prefix.status).toBe(401);
 
@@ -308,22 +315,22 @@ describe('backend server', () => {
     });
 
     it('is disabled with 503 when no ingest token is configured', async () => {
+      const { port, token } = await serve();
       delete process.env['BUILD_METRICS_INGEST_TOKEN'];
-      const port = await serve();
 
       const res = await request(
         port,
         '/build/metrics',
         'POST',
         { pipeline: 'ci', status: 'success', durationMs: 10 },
-        { Authorization: 'Bearer anything' },
+        { Authorization: `Bearer ${token}` },
       );
 
       expect(res.status).toBe(503);
     });
 
     it('keeps valid entries from a partly corrupt report and reports the rest', async () => {
-      const port = await serve();
+      const { port, token } = await serve();
 
       const res = await request(
         port,
@@ -335,7 +342,7 @@ describe('backend server', () => {
           { status: 'success', durationMs: 100 },
           { pipeline: 'ci', status: 'success', durationMs: -5 },
         ],
-        { Authorization: `Bearer ${TOKEN}` },
+        { Authorization: `Bearer ${token}` },
       );
 
       expect(res.status).toBe(202);
@@ -349,10 +356,10 @@ describe('backend server', () => {
     });
 
     it('rejects a malformed body with 400 instead of 500', async () => {
-      const port = await serve();
+      const { port, token } = await serve();
 
       const res = await request(port, '/build/metrics', 'POST', '{not json', {
-        Authorization: `Bearer ${TOKEN}`,
+        Authorization: `Bearer ${token}`,
       });
 
       expect(res.status).toBe(400);
@@ -360,7 +367,7 @@ describe('backend server', () => {
     });
 
     it('rejects an oversized report with 413', async () => {
-      const port = await serve();
+      const { port, token } = await serve();
 
       const huge = JSON.stringify({
         runs: [
@@ -373,11 +380,111 @@ describe('backend server', () => {
         ],
       });
       const res = await request(port, '/build/metrics', 'POST', huge, {
-        Authorization: `Bearer ${TOKEN}`,
+        Authorization: `Bearer ${token}`,
       });
 
       expect(res.status).toBe(413);
       expect(buildMetricsService.getMetrics().pipelines.ci).toBeUndefined();
+    });
+  });
+
+  describe('rate limit metering (issue #913)', () => {
+    let shutdowns: Array<() => Promise<void>> = [];
+
+    beforeEach(() => {
+      shutdowns = [];
+    });
+
+    afterEach(async () => {
+      for (const shutdown of shutdowns.reverse()) {
+        await shutdown();
+      }
+    });
+
+    async function serve(): Promise<number> {
+      const running = await startServer({
+        pool: makeMockPool(),
+        planBootstrap: makeBootstrap(),
+        listen: false,
+      });
+      shutdowns.push(running.shutdown);
+      return listenEphemeral(running.server);
+    }
+
+    const planBody = { name: 'Metered', price: 1, currency: 'USD', billingCycle: 'monthly' };
+
+    it('decrements the reported remaining quota on every metered response', async () => {
+      const port = await serve();
+      const key = `meter-${Date.now()}`;
+
+      const first = await request(port, '/plans', 'POST', planBody, { 'x-api-key': key });
+      const second = await request(port, '/plans', 'POST', planBody, { 'x-api-key': key });
+
+      expect(first.status).toBe(201);
+      expect(second.status).toBe(201);
+      // Headers are set from usage recorded by the *previous* response, so a
+      // flat 100 here is the signature of the metering bug.
+      expect(first.headers['x-ratelimit-remaining']).toBe('100');
+      expect(Number(second.headers['x-ratelimit-remaining'])).toBeLessThan(100);
+    });
+
+    it('eventually throttles a key that exhausts its hourly quota', async () => {
+      const port = await serve();
+      const key = `exhaust-${Date.now()}`;
+      const statuses: number[] = [];
+
+      // FREE tier allows 100 requests per hour.
+      for (let i = 0; i < 130; i++) {
+        const res = await request(port, '/plans', 'POST', planBody, { 'x-api-key': key });
+        statuses.push(res.status);
+      }
+
+      const created = statuses.filter((s) => s === 201).length;
+      const throttled = statuses.filter((s) => s === 429).length;
+      expect(created).toBeLessThanOrEqual(101);
+      expect(throttled).toBeGreaterThan(0);
+    });
+
+    it('meters routes declared above the old rate limit call site', async () => {
+      const port = await serve();
+      const key = `quotaroute-${Date.now()}`;
+
+      // Reaching a handler that used to sit above the applyRateLimit() call
+      // proves the limiter now runs ahead of the whole route table.
+      const res = await request(
+        port,
+        '/quota/check',
+        'POST',
+        { apiKey: key, tier: 'free' },
+        { 'x-api-key': key },
+      );
+
+      expect(res.status).toBe(200);
+      expect(JSON.parse(res.body)).toMatchObject({ allowed: true });
+    });
+
+    it('leaves skip-listed observability endpoints unthrottled', async () => {
+      const port = await serve();
+      const key = `scrape-${Date.now()}`;
+
+      for (let i = 0; i < 130; i++) {
+        const res = await request(port, '/metrics/build', 'GET', undefined, {
+          'x-api-key': key,
+        });
+        expect(res.status).toBe(200);
+        // A skipped path never reaches the limiter, so it carries no quota
+        // headers at all — which is what lets Prometheus scrape it freely.
+        expect(res.headers['x-ratelimit-remaining']).toBeUndefined();
+      }
+    });
+
+    it('never throttles a request with no API key', async () => {
+      const port = await serve();
+
+      for (let i = 0; i < 130; i++) {
+        const res = await request(port, '/plans', 'POST', planBody);
+        expect(res.status).toBe(201);
+      }
     });
   });
 });
